@@ -31,11 +31,11 @@ class DDQN(nn.Module):
     def __init__(self, n_actions):
         super(DDQN, self).__init__()
         # 
-        self.conv1 = nn.Conv2d(1,5,5,2)
+        self.conv1 = nn.Conv2d(3,8,5,2)
         self.pool = nn.MaxPool2d(2,2)
-        self.conv2 = nn.Conv2d(5,15,5,1)
+        self.conv2 = nn.Conv2d(8,16,5,1)
         
-        self.fc1 = nn.Linear(1500, 128)
+        self.fc1 = nn.Linear(1600, 128)
         self.fc2 = nn.Linear(128, 64)
         self.fc3 = nn.Linear(64, n_actions)
 
@@ -47,7 +47,7 @@ class DDQN(nn.Module):
         x = self.pool(F.relu(self.conv2(x)))
 
         x = torch.flatten(x, 1) # flatten all dimensions except batch
- 
+
         x = F.relu(self.fc1(x))
         x = F.relu(self.fc2(x))
         x = self.fc3(x)
@@ -64,12 +64,11 @@ class Combatant:
         self.line_of_sight = 3
         self.radar_coverage = 20
         self.missiles = 4 if ship_type == "small" else 8
-        self.missile_range = 50
+        self.missile_range = 100
         self.replenishment_points = replenishment_points  # List of replenishment points for the ship
-        self.can_move = True  # Flag indicating if the ship can move in the current turn
         self.target_list = []
-        self.radar_transmission = False
-        self.n_actions = 21 if ship_type == "medium" else 29
+        self.radar_transmission = 0
+        self.n_actions = 20 if ship_type == "medium" else 28
         self.policy = DDQN(self.n_actions)
         self.target = DDQN(self.n_actions)
         self.target.load_state_dict(self.policy.state_dict())
@@ -79,7 +78,6 @@ class Combatant:
         
     def get_obs(self):
         self.target_list.clear()
-        
         
         if self.side == 'blue':
             own_units = self.environment.blue_ships
@@ -92,15 +90,20 @@ class Combatant:
                     if math.sqrt((opponent.position[0] - ship.position[0]) ** 2 + (opponent.position[1] - ship.position[1]) ** 2) < ship.radar_coverage:
                         if random.random() < 0.9 and opponent.position not in observed_opposing_units:
                             observed_opposing_units.append((opponent.position[0], opponent.position[1]))
-                    if math.sqrt((opponent.position[0] - ship.position[0]) ** 2 + (opponent.position[1] - ship.position[1]) ** 2) < 75 and opponent.radar_transmission == True:
+                    if math.sqrt((opponent.position[0] - ship.position[0]) ** 2 + (opponent.position[1] - ship.position[1]) ** 2) < 75 and opponent.radar_transmission == 1:
                         not_obstructed = self.check_path((opponent.position[0], opponent.position[1]), ship.position)
-                        if opponent.position not in observed_opposing_units and not_obstructed == True:
+                        if opponent.position not in observed_opposing_units and not_obstructed:
                             if opponent in electronic_bearings.keys():
                                 electronic_bearings[opponent] += [(ship, self.calculate_bearing(ship, opponent))]
                             else:
                                 electronic_bearings[opponent] = [(ship, self.calculate_bearing(ship, opponent))]
             
             obs_space = self.environment.grid.copy()
+            obs_space = np.expand_dims(obs_space, axis=0)
+
+            expanded_dims = np.zeros((2, 100, 100))
+
+            obs_space = np.concatenate((obs_space, expanded_dims), axis=0)
             
             ew_fixes = []
             
@@ -116,29 +119,35 @@ class Combatant:
                             
                             for i in range(len(observations)):
                                 if i+1 < len(observations):
-                                    coord = self.calculate_fixed_position(observations[i][0], observations[i][1], observations[i+1][0], observations[i+1][1])
-                                    ew_x.append(coord[0])
-                                    ew_y.append(coord[1])
+                                    bx, by = self.calculate_fixed_position(observations[i][0], observations[i][1], observations[i+1][0], observations[i+1][1])
+                                    ew_x.append(bx)
+                                    ew_y.append(by)
             
                             ew_fixes.append((round(np.mean(ew_x)), round(np.mean(ew_y))))
                             self.environment.blue_ew.append((self.position, (round(np.mean(ew_x)), round(np.mean(ew_y)))))
             
             for unit_pos in own_units:
                 x, y = unit_pos.position
-                obs_space[x, y] = 2
+                obs_space[0, x, y] = 2
                 
             for unit_pos in observed_opposing_units:
                 x, y = unit_pos
-                obs_space[x, y] = 3
+                obs_space[0, x, y] = 3
                 self.target_list.append((x, y))
                 
             for unit_pos in ew_fixes:
                 x, y = unit_pos
                 if 0 <= x < 100 and 0 <= y < 100:
-                    obs_space[x, y] =  3
+                    obs_space[0, x, y] =  3
                     self.target_list.append((x, y))
                 
-            obs_space[self.position[0], self.position[1]] = 4
+            for unit in self.environment.blue_ships:
+                obs_space[1, unit.position[0], unit.position[1]] = 1 + unit.radar_transmission
+                obs_space[2, unit.position[0], unit.position[1]] = unit.missiles / 8
+
+            for r in self.replenishment_points:
+                x, y = r
+                obs_space[0, x, y] = 4
 
             return obs_space
 
@@ -150,19 +159,26 @@ class Combatant:
                 electronic_bearings = {} #dictionary to store [spotter, bearing] tuples for each opposing unit
                 
                 for ship in own_units:
-                    for opponent in self.environment.red_ships:
+                    for opponent in self.environment.blue_ships:
                         if math.sqrt((opponent.position[0] - ship.position[0]) ** 2 + (opponent.position[1] - ship.position[1]) ** 2) < ship.radar_coverage and self.check_path(ship.position, opponent.position):
                             if random.random() < 0.9 and opponent.position not in observed_opposing_units:
                                 observed_opposing_units.append((opponent.position[0], opponent.position[1]))
-                        if math.sqrt((opponent.position[0] - ship.position[0]) ** 2 + (opponent.position[1] - ship.position[1]) ** 2) < 75 and opponent.radar_transmission == True:
+                        if math.sqrt((opponent.position[0] - ship.position[0]) ** 2 + (opponent.position[1] - ship.position[1]) ** 2) < 75 and opponent.radar_transmission == 1:
                             not_obstructed = self.check_path((opponent.position[0], opponent.position[1]), ship.position)
-                            if opponent.position not in observed_opposing_units and not_obstructed == True:
+                            if opponent.position not in observed_opposing_units and not_obstructed:
                                 if opponent in electronic_bearings.keys():
                                     electronic_bearings[opponent] += [(ship, self.calculate_bearing(ship, opponent))]
                                 else:
                                     electronic_bearings[opponent] = [(ship, self.calculate_bearing(ship, opponent))]
                 
                 obs_space = self.environment.grid.copy()
+
+                obs_space = self.environment.grid.copy()
+                obs_space = np.expand_dims(obs_space, axis=0)
+
+                expanded_dims = np.zeros((2, 100, 100))
+
+                obs_space = np.concatenate((obs_space, expanded_dims), axis=0)
                 
                 ew_fixes = []
                 
@@ -178,54 +194,65 @@ class Combatant:
                                 
                                 for i in range(len(observations)):
                                     if i+1 < len(observations):
-                                        coord = self.calculate_fixed_position(observations[i][0], observations[i][1], observations[i+1][0], observations[i+1][1])
-                                        ew_x.append(coord[0])
-                                        ew_y.append(coord[1])
+                                        bx, by = self.calculate_fixed_position(observations[i][0], observations[i][1], observations[i+1][0], observations[i+1][1])
+                                        ew_x.append(bx)
+                                        ew_y.append(by)
                                 
                                 ew_fixes.append((round(np.mean(ew_x)), round(np.mean(ew_y))))
                                 self.environment.red_ew.append((self.position, (round(np.mean(ew_x)), round(np.mean(ew_y)))))
                 
-                for unit in own_units:
-                    x, y = unit.position
-                    obs_space[x, y] = 2
-                    
-            obs_space[self.position[0], self.position[1]] = 4
+            for unit in own_units:
+                x, y = unit.position
+                obs_space[0, x, y] = 2
                     
             for unit_pos in observed_opposing_units:
                 x, y = unit_pos
-                obs_space[x, y] = 3
+                obs_space[0, x, y] = 3
                 self.target_list.append((x, y))
                 
             for unit_pos in ew_fixes:
                 x, y = unit_pos
                 if 0 <= x < 100 and 0 <= y < 100:
-                    obs_space[x, y] = 3
+                    obs_space[0, x, y] = 3
                     self.target_list.append((x, y))
+
+            for unit in self.environment.red_ships:
+                obs_space[1, unit.position[0], unit.position[1]] = 1 + unit.radar_transmission
+                obs_space[2, unit.position[0], unit.position[1]] = unit.missiles / 8
+
+            for r in self.replenishment_points:
+                x, y = r
+                obs_space[0, x, y] = 4
                     
             return obs_space
             
     def calculate_bearing(self, measuring_ship, target_ship):
         dx = target_ship.position[0] - measuring_ship.position[0]
         dy = target_ship.position[1] - measuring_ship.position[1]
-        bearing = math.degrees(math.atan2(dy, dx))+random.gauss(0,1) #add distortion
+        bearing = math.degrees(math.atan2(dy, dx))
+
+        # add distortion due to inaccuracies
+        distortion = random.gauss(0, 1)
+
+        if bearing + distortion < 0:
+            bearing = bearing + distortion + 360
+        else:
+            bearing = bearing + distortion
+
+        # print(f'Calculated bearing: \n Side {measuring_ship.side} \n Bearing {bearing}')
         return bearing
         
     @staticmethod
     def calculate_fixed_position(ship1, bearing_ship1, ship2, bearing_ship2):
+
         x1, y1 = ship1.position
         x2, y2 = ship2.position
-        bearing1 = math.radians(bearing_ship1)
-        bearing2 = math.radians(bearing_ship2)
+        
+        m1 = math.tan(math.radians(bearing_ship1))
+        m2 = math.tan(math.radians(bearing_ship2))
 
-        dx = x2 - x1
-        dy = y2 - y1
-
-        distance = math.sqrt(dx**2 + dy**2)
-
-        angle = math.atan2(dy, dx) + bearing1 -bearing2
-
-        x3 = x1 + distance * math.cos(angle)
-        y3 = y1 + distance * math.sin(angle)
+        x3 = (m1 * x1 - m2 * x2 + y2 - y1) / (m1 - m2)
+        y3 = m1 * (x3 - x1) + y1
 
         return x3, y3
         
@@ -249,12 +276,6 @@ class Combatant:
     
     def move(self, new_position):
         self.position = new_position
-        
-    def radar_silence(self, silence):
-        if silence == True:
-            self.radar_transmission = False
-        else:
-            self.radar_transmission = True
         
     def can_move_to(self, x, y):
         #x, y = position
@@ -297,7 +318,7 @@ class Combatant:
         else:
             opposing_side = 'blue'
         
-        if action == 0:
+        if action == 0: #do nothing
             return (self.get_obs(), True)
         
         if action == 1:
@@ -310,17 +331,28 @@ class Combatant:
                 return (self.get_obs(), succesful_engagement)
                 
         if action == 2:
-            if self.radar_transmission == True:
-                self.radar_transmission = False
+            if self.radar_transmission == 1:
+                self.radar_transmission = 0
             else:
-                self.radar_transmission = True
+                self.radar_transmission = 1
             return (self.get_obs(), True)
         
+        if action == 3:
+            rrr_dist = 200
+            for rrr in self.replenishment_points:
+                distance = math.sqrt((self.position[0]-rrr[0])**2 + (self.position[1]-rrr[1])**2)
+                if distance < rrr_dist:
+                    rrr_dist = distance
+            if rrr_dist < 1:
+                self.missiles = 4 if self.ship_type == "small" else 8
+                return (self.get_obs(), True)
+            else:
+                return (self.get_obs(), False)
      
-        if action == 3: #Move one square North
+        if action == 4: #Move one square North
             destination = (x, y+1)
             if self.can_move_to(x, y+1):
-                if self.check_path(self.position, destination) and self.can_move == True:
+                if self.check_path(self.position, destination):
                     self.move((x, y+1))
                     return (self.get_obs(), True)
                 else:
@@ -329,10 +361,10 @@ class Combatant:
                 return (self.get_obs(), False)
 
                 
-        if action == 4: #Move two squares North
+        if action == 5: #Move two squares North
             destination = (x, y+2)
             if self.can_move_to(x, y+2):
-                if self.check_path(self.position, destination) and self.can_move == True:
+                if self.check_path(self.position, destination):
                     self.move((x, y+2))
                     return (self.get_obs(), True)
                 else:
@@ -341,10 +373,10 @@ class Combatant:
                 return (self.get_obs(), False)
                 
                 
-        if action == 5: #Move one square East
+        if action == 6: #Move one square East
             destination = (x+1, y)
             if self.can_move_to(x+1, y):
-                if self.check_path(self.position, destination) and self.can_move == True:
+                if self.check_path(self.position, destination):
                     self.move((x+1, y))
                     return (self.get_obs(), True)
                 else:
@@ -353,10 +385,10 @@ class Combatant:
                 return (self.get_obs(), False)
 
             
-        if action == 6: #Move two squares East
+        if action == 7: #Move two squares East
             destination = (x+2, y)
             if self.can_move_to(x+2, y):
-                if self.check_path(self.position, destination) and self.can_move == True:
+                if self.check_path(self.position, destination):
                     self.move((x+2, y))
                     return (self.get_obs(), True)
                 else:
@@ -365,10 +397,10 @@ class Combatant:
                 return (self.get_obs(), False)
 
             
-        if action == 7: #Move one square South
+        if action == 8: #Move one square South
             destination = (x, y-1)
             if self.can_move_to(x, y-1):
-                if self.check_path(self.position, destination) and self.can_move == True:
+                if self.check_path(self.position, destination):
                     self.move((x, y-1))
                     return (self.get_obs(), True)
                 else:
@@ -377,10 +409,10 @@ class Combatant:
                 return (self.get_obs(), False)
 
                 
-        if action == 8: #Move two squares South
+        if action == 9: #Move two squares South
             destination = (x, y-2)
             if self.can_move_to(x, y-2):
-                if self.check_path(self.position, destination) and self.can_move == True:
+                if self.check_path(self.position, destination):
                     self.move((x, y-2))
                     return (self.get_obs(), True)
                 else:
@@ -388,10 +420,10 @@ class Combatant:
             else:
                 return (self.get_obs(), False)
                 
-        if action == 9: #Move one square West
+        if action == 10: #Move one square West
             destination = (x-1, y)
             if self.can_move_to(x-1, y):
-                if self.check_path(self.position, destination) and self.can_move == True:
+                if self.check_path(self.position, destination):
                     self.move((x-1, y))
                     return (self.get_obs(), True)
                 else:
@@ -399,40 +431,21 @@ class Combatant:
             else:
                 return (self.get_obs(), False)
             
-        if action == 10: #Move two squares West
+        if action == 11: #Move two squares West
             destination = (x-2, y)
             if self.can_move_to(x-2, y):
-                if self.check_path(self.position, destination) and self.can_move == True:
+                if self.check_path(self.position, destination):
                     self.move((x-2, y))
                     return (self.get_obs(), True)
                 else:
                     return (self.get_obs(), False)
             else:
                 return (self.get_obs(), False)          
-            
-        if action == 11:
-            for ras in self.replenishment_points:
-                if math.sqrt((x - ras[0]) ** 2 + (y - ras[1]) ** 2) <= 1 and self.can_move == True:
-                    self.can_move = False
-                    return (self.get_obs(), True)
-                else:
-                    return (self.get_obs(), False)
-            return (self.get_obs(), False)
-        
-                    
-        if action == 12:
-            if self.can_move == False:
-                self.can_move = True
-                return (self.get_obs(), True)
-            else:
-                self.can_move = False
-                return (self.get_obs(), True)
                 
-                
-        if action == 13: #Move one square North-East
+        if action == 12: #Move one square North-East
             destination = (x+1, y+1)
             if self.can_move_to(x+1, y+1):
-                if self.check_path(self.position, destination) and self.can_move == True:
+                if self.check_path(self.position, destination):
                     self.move((x+1, y+1))
                     return (self.get_obs(), True)
                 else:
@@ -441,10 +454,10 @@ class Combatant:
                 return (self.get_obs(), False)
 
                 
-        if action == 14: #Move two squares North-East
+        if action == 13: #Move two squares North-East
             destination = (x+2, y+2)
             if self.can_move_to(x+2, y+2):
-                if self.check_path(self.position, destination) and self.can_move == True:
+                if self.check_path(self.position, destination):
                     self.move((x+2, y+2))
                     return self.get_obs(), True
                 else:
@@ -453,10 +466,10 @@ class Combatant:
                 return self.get_obs(), False
                 
     
-        if action == 15: #Move one square South-East
+        if action == 14: #Move one square South-East
             destination = (x+1, y-1)
             if self.can_move_to(x+1, y-1):
-                if self.check_path(self.position, destination) and self.can_move == True:
+                if self.check_path(self.position, destination):
                     self.move((x+1, y-1))
                     return self.get_obs(), True
                 else:
@@ -465,10 +478,10 @@ class Combatant:
                 return self.get_obs(), False
 
             
-        if action == 16: #Move two squares South-East
+        if action == 15: #Move two squares South-East
             destination = (x+2, y-2)
             if self.can_move_to(x+2, y-2):
-                if self.check_path(self.position, destination) and self.can_move == True:
+                if self.check_path(self.position, destination):
                     self.move((x+2, y-2))
                     return self.get_obs(), True
                 else:
@@ -477,10 +490,10 @@ class Combatant:
                 return self.get_obs(), False
 
             
-        if action == 17: #Move one square South-West
+        if action == 16: #Move one square South-West
             destination = (x-1, y-1)
             if self.can_move_to(x-1, y-1):
-                if self.check_path(self.position, destination) and self.can_move == True:
+                if self.check_path(self.position, destination):
                     self.move((x-1, y-1))
                     return self.get_obs(), True
                 else:
@@ -489,10 +502,10 @@ class Combatant:
                 return self.get_obs(), False
 
                 
-        if action == 18: #Move two squares South-West
+        if action == 17: #Move two squares South-West
             destination = (x-2, y-2)
             if self.can_move_to(x-2, y-2):
-                if self.check_path(self.position, destination) and self.can_move == True:
+                if self.check_path(self.position, destination):
                     self.move((x-2, y-2))
                     return self.get_obs(), True
                 else:
@@ -501,10 +514,10 @@ class Combatant:
                 return self.get_obs(), False
 
                 
-        if action == 19: #Move one square North-West
+        if action == 18: #Move one square North-West
             destination = (x-1, y+1)
             if self.can_move_to(x-1, y+1):
-                if self.check_path(self.position, destination) and self.can_move == True:
+                if self.check_path(self.position, destination):
                     self.move((x-1, y+1))
                     return self.get_obs(), True
                 else:
@@ -512,10 +525,10 @@ class Combatant:
             else:
                 return self.get_obs(), False
             
-        if action == 20: #Move two squares North-West
+        if action == 19: #Move two squares North-West
             destination = (x-2, y+2)
             if self.can_move_to(x-2, y+2):
-                if self.check_path(self.position, destination) and self.can_move == True:
+                if self.check_path(self.position, destination):
                     self.move((x-2, y+2))
                     return self.get_obs(), True
                 else:
@@ -524,10 +537,10 @@ class Combatant:
                 return self.get_obs(), False
                 
                 
-        if action == 21: #Move three squares North-West
+        if action == 20: #Move three squares North-West
             destination = (x-3, y+3)
             if self.can_move_to(x-3, y+3):
-                if self.check_path(self.position, destination) and self.can_move == True:
+                if self.check_path(self.position, destination):
                     self.move((x-3, y+3))
                     return self.get_obs(), True
                 else:
@@ -535,12 +548,12 @@ class Combatant:
             else:
                 return self.get_obs(), False
                 
-        if action == 22: #Move three squares North
+        if action == 21: #Move three squares North
             destination = (x, y+3)
             #print('Can move: {}'.format(self.can_move_to(x, y+3)))
             if self.can_move_to(x, y+3):
                 #print('Path: {}'.format(self.check_path(self.position, destination)))
-                if self.check_path(self.position, destination) and self.can_move == True:
+                if self.check_path(self.position, destination):
                     self.move((x, y+3))
                     return self.get_obs(), True
                 else:
@@ -548,10 +561,10 @@ class Combatant:
             else:
                 return self.get_obs(), False
                 
-        if action == 23: #Move three squares North-East
+        if action == 22: #Move three squares North-East
             destination = (x+3, y+3)
             if self.can_move_to(x+3, y+3):
-                if self.check_path(self.position, destination) and self.can_move == True:
+                if self.check_path(self.position, destination):
                     self.move((x+3, y+3))
                     return self.get_obs(), True
                 else:
@@ -559,10 +572,10 @@ class Combatant:
             else:
                 return self.get_obs(), False
                 
-        if action == 24: #Move three squares East
+        if action == 23: #Move three squares East
             destination = (x+3, y)
             if self.can_move_to(x+3, y):
-                if self.check_path(self.position, destination) and self.can_move == True:
+                if self.check_path(self.position, destination):
                     self.move((x+3, y))
                     return self.get_obs(), True
                 else:
@@ -570,10 +583,10 @@ class Combatant:
             else:
                 return self.get_obs(), False
                 
-        if action == 25: #Move three squares South-East
+        if action == 24: #Move three squares South-East
             destination = (x+3, y-3)
             if self.can_move_to(x+3, y-3):
-                if self.check_path(self.position, destination) and self.can_move == True:
+                if self.check_path(self.position, destination):
                     self.move((x+3, y-3))
                     return self.get_obs(), True
                 else:
@@ -581,10 +594,10 @@ class Combatant:
             else:
                 return self.get_obs(), False
                 
-        if action == 26: #Move three squares South
+        if action == 25: #Move three squares South
             destination = (x, y-3)
             if self.can_move_to(x, y-3):
-                if self.check_path(self.position, destination) and self.can_move == True:
+                if self.check_path(self.position, destination):
                     self.move((x, y-3))
                     return self.get_obs(), True
                 else:
@@ -592,10 +605,10 @@ class Combatant:
             else:
                 return self.get_obs(), False
                 
-        if action == 27: #Move three squares South-West
+        if action == 26: #Move three squares South-West
             destination = (x-3, y-3)
             if self.can_move_to(x-3, y-3):
-                if self.check_path(self.position, destination) and self.can_move == True:
+                if self.check_path(self.position, destination):
                     self.move((x-3, y-3))
                     return self.get_obs(), True
                 else:
@@ -603,10 +616,10 @@ class Combatant:
             else:
                 return self.get_obs(), False
                 
-        if action == 28: #Move three squares West
+        if action == 27: #Move three squares West
             destination = (x-3, y)
             if self.can_move_to(x-3, y):
-                if self.check_path(self.position, destination) and self.can_move == True:
+                if self.check_path(self.position, destination):
                     self.move((x-3, y))
                     return self.get_obs(), True
                 else:
@@ -614,7 +627,6 @@ class Combatant:
             else:
                 return self.get_obs(), False
                     
-        
         
 ##############################
     def check_target(self, target, side):
@@ -624,7 +636,7 @@ class Combatant:
             opponent = self.environment.red_ships
             
         for ship in opponent:
-            if math.sqrt((ship.position[0] - target[0]) ** 2 + (ship.position[1] - target[1]) ** 2) <= 1.5:
+            if math.sqrt((ship.position[0] - target[0]) ** 2 + (ship.position[1] - target[1]) ** 2) <= 2:
                 return ship
             else:
                 return None
@@ -634,69 +646,97 @@ class Combatant:
         hit = False
             
         target = self.check_target(target, side)
+
+        num_msl = 0
             
         if target is not None:
             if self.missiles == 0:
-                print("No missiles left")
+                print(f'{self.side} unit at {self.position} has no missiles left')
                 return hit
                 # missile firing logic here
+
             else:
+                detected = True
+                if random.random() < 0.345:
+                    detected = False
+
+                if detected:
+                    hit_prob = 0.45
+                else:
+                    hit_prob = 0.63
+
                 if target.ship_type == "small":
-                    if self.missiles >= 2:
-                        self.missiles = self.missiles - 2
-                        prob = self.calculate_hit_probability(2, 0.9)
+                    if self.missiles > 2:
+                        num_msl = random.randint(2, 4)
+                        self.missiles = self.missiles - num_msl
+                        prob = self.calculate_hit_probability(num_msl, hit_prob)
+                        
                         if prob > random.random():
                             hit = True
-                        print(f"Fired 2 missiles from {self.position} to {target.position}. Hit: {hit}")
+                        print(f"{self.side} fired {num_msl} missiles from {self.position} to {target.position}. Hit: {hit}")
                     else:
-                        msl = self.missiles
-                        prob = self.calculate_hit_probability(msl, 0.9)
+                        num_msl = self.missiles
+                        prob = self.calculate_hit_probability(msl, hit_prob)
+                        
                         if prob > random.random():
                             hit = True
                         self.missiles = 0
-                        print(f"Fired {msl} missiles from {self.position} to {target.position}. Hit: {hit}. No missiles left")
+                        print(f"{self.side} fired {num_msl} missiles from {self.position} to {target.position}. Hit: {hit}. No missiles left")
                 if target.ship_type == "medium":
-                    if self.missiles >= 3:
-                        self.missiles = self.missiles - 3
-                        prob = self.calculate_hit_probability(3, 0.8)
+                    if self.missiles > 3:
+                        num_msl = random.randint(3, self.missiles)
+                        self.missiles = self.missiles - num_msl
+                        prob = self.calculate_hit_probability(num_msl, hit_prob)
+                        
                         if prob > random.random():
                             hit = True
-                        print(f"Fired 2 missiles from {self.position} to {target.position}. Hit: {hit}")
+                        print(f"{self.side} fired {num_msl} missiles from {self.position} to {target.position}. Hit: {hit}")
                     else:
-                        msl = self.missiles
-                        prob = self.calculate_hit_probability(msl, 0.8)
+                        num_msl = self.missiles
+                        prob = self.calculate_hit_probability(num_msl, hit_prob)
+                        
                         if prob > random.random():
                             hit = True
                         self.missiles = 0
-                        print(f"Fired {msl} missiles from {self.position} to {target.position}. Hit: {hit}. No missiles left")
+                        print(f"{self.side} fired {num_msl} missiles from {self.position} to {target.position}. Hit: {hit}. No missiles left")
                 if target.ship_type == "large":
-                    if self.missiles >= 4:
-                        self.missiles = self.missiles - 4
-                        prob = self.calculate_hit_probability(4, 0.7)
+                    if self.missiles > 3:
+                        num_msl = random.randint(3, self.missiles)
+                        self.missiles = self.missiles - num_msl
+                        prob = self.calculate_hit_probability(num_msl, hit_prob)
+                        
                         if prob > random.random():
                             hit = True
-                        print(f"Fired 2 missiles from {self.position} to {target.position}. Hit: {hit}")
+                        print(f"{self.side} fired {num_msl} missiles from {self.position} to {target.position}. Hit: {hit}")
                     else:
-                        msl = self.missiles
-                        prob = self.calculate_hit_probability(msl, 0.7)
+                        num_msl = self.missiles
+                        prob = self.calculate_hit_probability(num_msl, hit_prob)
+                        
                         if prob > random.random():
                             hit = True
                         self.missiles = 0
-                        print(f"Fired {msl} missiles from {self.position} to {target.position}. Hit: {hit}. No missiles left")
+                        print(f"{self.side} fired {num_msl} missiles from {self.position} to {target.position}. Hit: {hit}. No missiles left")
                         
             if hit:
+                self.environment.engagements.append((self.position, target.position, num_msl))
+
                 if side == 'blue':
                     self.environment.blue_ships.remove(target)
                 else:
                     self.environment.red_ships.remove(target)
                 
-            return hit
+        return hit
         
                     
                     
     def calculate_hit_probability(self, num_missiles, probability_of_hit):
         #binomial_dist = stats.binom(num_missiles, probability_of_hit)
-        probability = binom.pmf(1, num_missiles, probability_of_hit)
+        #probability = binom.pmf(1, num_missiles, probability_of_hit)
+
+        prob_no_success = (1-probability_of_hit)**num_missiles
+
+        probability = 1 - prob_no_success
+
         return probability
 
     def replenish_missiles(self):
@@ -783,13 +823,17 @@ class Game:
         self.grid_size = 100
         self.blue_ships = []
         self.red_ships = []
-        self.blue_replenishment_points = [(89, 84), (74, 90)]
-        self.red_replenishment_points = [(23,10), (55,4)]
+        self.blue_replenishment_points = [(87, 87), (77, 94)]
+        self.red_replenishment_points = [(28,18), (50,4)]
         self.num_blue = 2
         self.num_red = 2
         self.imagen = 0
         self.red_ew = []
         self.blue_ew = []
+        self.engagements = []
+
+        self.blue = []
+        self.red = []
 
     def get_grid(self):
         return self.grid
@@ -809,23 +853,23 @@ class Game:
         if ship_type == "small":
             ship = Combatant(self, side, ship_type, position, replenishment)
             if side == "blue":
-                self.blue_ships.append(ship)
+                self.blue.append(ship)
             elif side == "red":
-                self.red_ships.append(ship)
+                self.red.append(ship)
                 
         if ship_type == "medium":
             ship = Combatant(self, side, ship_type, position, replenishment)
             if side == "blue":
-                self.blue_ships.append(ship)
+                self.blue.append(ship)
             elif side == "red":
-                self.red_ships.append(ship)
+                self.red.append(ship)
                 
         if ship_type == "large":
             ship = Combatant(self, side, ship_type, position, replenishment)
             if side == "blue":
-                self.blue_ships.append(ship)
+                self.blue.append(ship)
             elif side == "red":
-                self.red_ships.append(ship)
+                self.red.append(ship)
             
     def move_ship(self, ship, destination):
         current_position = ship.position
@@ -845,31 +889,52 @@ class Game:
         count = np.count_nonzero(obs == 3)
         
         reward = count
-                
-        reward -= 1
         
         return reward
+    
+
+    def create_combatants(self):
+
+        self.create_ship("blue", "small", (90, 80), self.blue_replenishment_points)
+        self.create_ship("blue", "small", (65, 80), self.blue_replenishment_points)
+        #self.create_ship("blue", "medium", (70, 80), self.blue_replenishment_points)
         
-        
+        self.create_ship("red", "large", (45, 15), self.red_replenishment_points)
+        self.create_ship("red", "large", (40, 12), self.red_replenishment_points)
+        #self.create_ship("red", "medium", (50, 12), self.red_replenishment_points)
 
     def initialize_game(self):
 
         self.define_grid_from_image("balt_mod_400x400.png", 100)
-        self.imagen = 0
+        # self.imagen = 0
         
+        blue_pos = [(90, 80), (65, 80)]
+        red_pos = [(45, 15), (40, 12)]
+
         # Create ships for blue side
         self.blue_ships.clear()
-        self.create_ship("blue", "small", (90, 80), self.blue_replenishment_points)
-        self.create_ship("blue", "small", (80, 80), self.blue_replenishment_points)
+        
+        for p, ship in enumerate(self.blue):
+            pos = blue_pos[p]
+            ship.position = pos
+            ship.radar_transmission = 0
+            ship.missiles = 4 if ship.ship_type == "small" else 8
+            ship.steps_done = 0
+            self.blue_ships.append(ship)
 
         self.num_blue = len(self.blue_ships)
-        #self.create_ship("blue", "medium", (70, 80), self.blue_replenishment_points)
 
         # Create ships for red side
         self.red_ships.clear()
-        #self.create_ship("red", "medium", (50, 12), self.red_replenishment_points)
-        self.create_ship("red", "large", (45, 15), self.red_replenishment_points)
-        self.create_ship("red", "large", (40, 12), self.red_replenishment_points)
+        
+        for p, ship in enumerate(self.red):
+            pos = red_pos[p]
+            ship.position = pos
+            ship.radar_transmission = 0
+            ship.missiles = 4 if ship.ship_type == "small" else 8
+            ship.steps_done = 0
+            self.red_ships.append(ship)
+
 
         self.num_red = len(self.red_ships)
 
@@ -928,7 +993,7 @@ class Game:
         grayscale_image = resized_image.convert("L")
 
         # Threshold the grayscale image
-        threshold_value = 128
+        threshold_value = 80
         thresholded_image = grayscale_image.point(lambda x: 0 if x < threshold_value else 255, "1")
 
         # Create the game grid
@@ -936,11 +1001,16 @@ class Game:
 
         for x in range(grid_size):
             for y in range(grid_size):
-                pixel = thresholded_image.getpixel((x, y))
+                pixel = thresholded_image.getpixel((x, grid_size-1-y))
                 if pixel == 255:
                     grid[y, x] = 1  # Open sea
                 else:
                     grid[y, x] = 0  # Littoral area
+
+        grid[90, 77] = 0
+        grid[90, 74] = 0
+        grid[89, 74] = 0
+        grid[90, 70] = 0
 
         self.grid = grid
         
@@ -979,37 +1049,63 @@ class Game:
 
         # Plot field of vision
         for ship in self.blue_ships + self.red_ships:
-            if ship.rad_transmission:
+            if ship.radar_transmission == 1:
                 x, y = ship.position
                 radius = ship.radar_coverage
-                x = max(0, min(x, self.grid_size - 1))
-                y = max(0, min(y, self.grid_size - 1))
+                # x = max(radius, min(x, self.grid_size - 1 - radius))
+                # y = max(radius, min(y, self.grid_size - 1 - radius))
+
+                #radius = min(radius, min(x, y, self.grid_size - 1 - x, self.grid_size - 1 - y))
+
                 circle = Circle((x + 0.0, y + 0.0), radius, alpha=0.2, edgecolor=None)
                 ax.add_patch(circle)
         
         if self.blue_replenishment_points:
             for point in self.blue_replenishment_points:
                 p = (point[0]+0.0, point[1]+0.0)
-                ax.plot(*p, 'bx', markersize=8, label='Replenishment Point')
+                ax.plot(*p, 'bv', markersize=5, label='Replenishment Point')
                 
         if self.red_replenishment_points:
             for point in self.red_replenishment_points:
                 p = (point[0]+0.0, point[1]+0.0)
-                ax.plot(*p, 'rx', markersize=8, label='Replenishment Point')
+                ax.plot(*p, 'rv', markersize=5, label='Replenishment Point')
 
         # plot ew bearings
         if self.blue_ew:
             for p in self.blue_ew:
-                ax.plot(p[0], p[1], 'b-')
+                x1 = p[0][0]
+                x2 = p[1][0]
+                y1 = p[0][1]
+                y2 = p[1][1]
+                ax.plot([x1, x2], [y1, y2], 'b-')
         
         if self.red_ew:
             for p in self.red_ew:
-                ax.plot(p[0], p[1], 'r-')
+                x1 = p[0][0]
+                x2 = p[1][0]
+                y1 = p[0][1]
+                y2 = p[1][1]
+                ax.plot([x1, x2], [y1, y2], 'r-')
+
+        if self.engagements:
+            for e in self.engagements:
+                launch, target, msl = e
+                x1 = launch[0]
+                x2 = target[0]
+                y1 = launch[1]
+                y2 = target[1]
+                ax.plot([x1, x2], [y1, y2], '-', color="orange")
+                ax.plot(x2, y2, 'X', color="orange")
+                ax.text(x2, y2, f'{msl} missiles')
         
         # Add legend and grid labels
         ax.set_xticklabels([])
         ax.set_yticklabels([])
         ax.set_title("Game Grid")
+
+
+        ax.set_xlim(0 - 0.5, 100 + 0.5)
+        ax.set_ylim(0 - 0.5, 100 + 0.5)
 
         # Show the plot
         plt.grid(True)
@@ -1024,4 +1120,5 @@ class Game:
 #game.initialize_game()
 #game.visualize_grid()
 #game.play_game()
+
 
