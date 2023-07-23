@@ -25,6 +25,7 @@ print('Using device:', device)
 
 PATH = os.path.join(os.getcwd(), 'models')
 
+load_models = False
 
 class ReplayMemory(object):
     def __init__(self, capacity):
@@ -54,10 +55,25 @@ ALPHA = 0.1
 GAMMA = 0.95
 EPSILON = 0.99
 EPSILON_END = 0.01
-DECAY = 300
+DECAY = 500
 TGT_UPD = 10
 
 env = Game()
+
+def average_weights(models):
+    averaged_model = models[0].__class__(28)
+
+    averaged_params = averaged_model.parameters()
+
+    for model in models:
+        model_params = model.parameters()
+        for avg_param, model_param in zip(averaged_params, model_params):
+            avg_param.data.add_(model_param.data.to('cpu'))
+
+    for avg_param in averaged_params:
+        avg_param.data.div_(len(models))
+
+    return averaged_model
 
 def get_epsilon(t):
     threshold = EPSILON_END + (EPSILON - EPSILON_END)*math.exp(-1. * t / DECAY)
@@ -73,10 +89,10 @@ def optimize(policy_net, target_net, memory, optimizer, criterion):
     batch = Transition(*zip(*transitions))
     
     state_batch = torch.cat(batch.state).to(device).to(torch.float)
-    action_batch = torch.cat(batch.action).unsqueeze(1).to(device)
+    action_batch = torch.cat(batch.action).to(device)
     reward_batch = torch.cat(batch.reward).to(device)
     done = torch.cat(batch.done).to(device)
-    next_state = torch.cat(batch.next_state).to(device).to(torch.float).unsqueeze(1)
+    next_state = torch.cat(batch.next_state).to(device).to(torch.float)
     
     policy_net.eval()
     with torch.no_grad():
@@ -85,8 +101,8 @@ def optimize(policy_net, target_net, memory, optimizer, criterion):
         next_state_values = target_net(next_state.to(torch.float)).squeeze().gather(1, actions_new).squeeze()
     
     policy_net.train()
-    
-    state_action_values = policy_net(state_batch).gather(1, action_batch).squeeze()
+
+    state_action_values = policy_net(state_batch).gather(1, action_batch.unsqueeze(1)).squeeze()
     
     expected_state_action = reward_batch + (GAMMA * next_state_values*done)
     loss = criterion(state_action_values, expected_state_action)
@@ -101,6 +117,7 @@ def optimize(policy_net, target_net, memory, optimizer, criterion):
     
     return env
     
+env.create_combatants()
 env.initialize_game()
 
 blue_memory = []
@@ -115,7 +132,7 @@ for i in range(len(env.red_ships)):
 if not skip_training:
     """Training"""
 
-    episodes = 200
+    episodes = 250
 
     seed = 21 # random.randint(0,100)
     random.seed(seed)
@@ -126,10 +143,29 @@ if not skip_training:
 
     total_steps = 0
     
+    if load_models:
+        for num, unit in enumerate(env.blue_ships):
+            file = os.path.join(PATH, 'blue' + str(num))
+            unit.policy.load_state_dict(torch.load(file))
+            print(f'Loaded model: {file}')
+
+        for num, unit in enumerate(env.red_ships):
+            file = os.path.join(PATH, 'red' + str(num))
+            unit.policy.load_state_dict(torch.load(file))
+            print(f'Loaded model: {file}')
+
+    env.imagen = 0
 
     for i in range(1, episodes):
-        print('\n EPISODE', i)
+        print('\n EPISODE \n', i)
         env.initialize_game()
+
+        """
+
+        """
+
+        # env.imagen = 0
+        # env.visualize_grid()
         
         epochs, penalties, reward = 0, 0, 0
 
@@ -156,22 +192,22 @@ if not skip_training:
             
             env.red_ew.clear()
             env.blue_ew.clear()
+            env.engagements.clear()
 
             blue_memory_inserts = []
             red_memory_inserts = []
 
             
-            if episode_steps % 100 == 0:
-                print('\n')
+            if episode_steps % 20 == 0:
                 print('Episode steps: {}'.format(episode_steps))
 
             for m, unit in enumerate(env.blue_ships):
                 
                 unit.policy.to(device)
 
-                state = unit.get_obs()
-                blue_state = np.expand_dims(state, 0)
-                
+                blue_state = unit.get_obs()
+                #blue_state = np.expand_dims(state, 0)
+
                 e = get_epsilon(unit.steps_done)
 
                 if random.uniform(0, 1) < e:
@@ -188,9 +224,7 @@ if not skip_training:
 
                 blue_new_state, blue_reward, blue_done, info = env.step(unit, blue_action) # check next state w.r.t. the action
                 
-                blue_reward -= 0.1*unit.steps_done
-
-                all_blue_rewards.append(blue_reward)
+                blue_reward -= 0.01*unit.steps_done
 
                 memory = blue_memory[m]
 
@@ -202,6 +236,8 @@ if not skip_training:
                 if unit.steps_done % BATCH_SIZE == 0 and memory.__len__() > BATCH_SIZE:
                 
                     optimize(unit.policy, unit.target, memory, unit.optimizer, criterion)
+                    #file = os.path.join(PATH, 'blue' + str(m))
+                    #torch.save(unit.target.state_dict(), file)
                 
                 if unit.steps_done % TGT_UPD == 0:
                     unit.target.load_state_dict(unit.policy.state_dict())
@@ -216,7 +252,7 @@ if not skip_training:
                 unit.policy.to(device)
                 
                 state = unit.get_obs()
-                state = np.expand_dims(state, 0)
+                #state = np.expand_dims(state, 0)
 
                 e = get_epsilon(unit.steps_done)
                     
@@ -233,7 +269,7 @@ if not skip_training:
                 oldpos = unit.position
                 new_state, red_reward, done, info = env.step(unit, action) # check next state w.r.t. the action
                 
-                red_reward -= 0.1*unit.steps_done
+                red_reward -= 0.01*unit.steps_done
 
                 all_red_rewards.append(red_reward)
 
@@ -248,6 +284,8 @@ if not skip_training:
                 if unit.steps_done % BATCH_SIZE == 0 and memory.__len__() > BATCH_SIZE:
                 
                     optimize(unit.policy, unit.target, memory, unit.optimizer, criterion)
+                    #file = os.path.join(PATH, 'red' + str(m))
+                    #torch.save(unit.target.state_dict(), file)
 
                 if unit.steps_done % TGT_UPD == 0:
                     unit.target.load_state_dict(unit.policy.state_dict())
@@ -268,6 +306,19 @@ if not skip_training:
             if env.num_blue == 0:
                 red_total_reward += 100
 
+            min_dist = 200
+
+            for unit in env.red_ships:
+                if math.sqrt((unit.position[0]-50)**2 + (unit.position[1]-50)**2) < min_dist:
+                    min_dist = math.sqrt((unit.position[0]-50)**2 + (unit.position[1]-50)**2)
+
+            if min_dist != 0:
+                red_total_reward += (1/min_dist)
+            else:
+                red_total_reward += 0
+
+            b_reward = 0
+
             for m, n in enumerate(blue_memory_inserts):
                 state, action, new_state, breward, done = n
                 blue_memory[m].push(
@@ -277,6 +328,11 @@ if not skip_training:
                     torch.tensor([breward + blue_total_reward]),
                     torch.tensor([done])
                     )
+                b_reward += breward
+                
+            all_blue_rewards.append(b_reward)
+
+            r_reward = 0
                 
             for m, n in enumerate(red_memory_inserts):
                 state, action, new_state, rreward, done = n
@@ -287,14 +343,41 @@ if not skip_training:
                     torch.tensor([rreward + red_total_reward]),
                     torch.tensor([done])
                     )
-                
+                r_reward += rreward
+
+            all_red_rewards.append(r_reward)
+            
             episode_steps += 1
 
-            if episode_steps > 400:
+            if episode_steps > 220:
                 done = 0
-        
-            if i % 50 == 0:
+
+            #if i % 50 == 0:
+            #    env.visualize_grid()
+
+            if env.engagements:
                 env.visualize_grid()
+
+        if i % 20 == 0:
+            blue_models = []
+            for unit in env.blue_ships:
+                blue_models.append(unit.policy) 
+
+            red_models = []
+            for unit in env.red_ships:
+                red_models.append(unit.policy)
+
+            if len(blue_models) > 1:
+                blue_averaged_model = average_weights(blue_models)
+                for unit in env.blue_ships:
+                    unit.policy.load_state_dict(blue_averaged_model.state_dict())
+                print("Blue models aggregated.")
+
+            if len(red_models) > 1:
+                red_averaged_model = average_weights(red_models)       
+                for unit in env.red_ships: 
+                    unit.policy.load_state_dict(red_averaged_model.state_dict())
+                print("Red models aggregated.")
 
             
             """
@@ -304,16 +387,25 @@ if not skip_training:
                 torch.save(unit.target_net.state_dict, PATH)
             """
     print("Training finished.\n")
+    
+    fig, axs = plt.subplots(2, 1, constrained_layout=True)
+    axs[0].plot(list(range(0, len(all_blue_rewards))), all_blue_rewards, 'b', '-')
+    fig.suptitle('Blue rewards')
 
-    plt.plot(all_blue_rewards)
-    plt.plot(all_red_rewards)
+    axs[1].plot(list(range(0, len(all_red_rewards))), all_red_rewards, 'r', '-')
+    fig.suptitle('Red rewards')
+
     plt.show()
         
     for num, unit in enumerate(env.blue_ships):
-        torch.save(unit.target.state_dict(), PATH + num + 'blue')
+        file = os.path.join(PATH, 'blue' + str(num))
+        torch.save(unit.target.state_dict(), file)
+        print(f'Saved model: {file}')
 
     for num, unit in enumerate(env.red_ships):
-        torch.save(unit.target.state_dict(), PATH + num + 'red')
+        file = os.path.join(PATH, 'red' + str(num))
+        torch.save(unit.target.state_dict(), file)
+        print(f'Saved model: {file}')
     
     print("Training finished.\n")
     
