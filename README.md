@@ -1,4 +1,5 @@
-# Littoral-ASUW-simulator
+# Littoral-Anti-Surface-Warfare-Environment-and-Multi-Agent-Reinforcement-Learning
+
 A RL environment for littoral surface warfare
 
 The project includes a game environment that maps an image of the northern Baltic Sea into a game grid of 100 x 100 squares. Red and blue sides aim to annihilate one another in this naval warfare scenario.
