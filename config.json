@@ -1,0 +1,43 @@
+{
+    "overall": {
+        "seed": 42,
+        "wandb": true,
+        "save_models": true,
+        "discrete": false,
+        "landing_ops": true,
+        "coa_path": true,
+        "tactics": "aggressive"
+    },
+    "environment_setup": {
+        "ew_threshold": 70,
+        "movement_threshold": 74,
+        "side": "blue",
+        "n_blue": 3,
+        "n_red": 2,
+        "n_red_landingship": 1,
+        "red_aggression": 0.4,
+        "trained_red": true,
+        "trained_blue": true
+    },
+    "model_selection": {
+        "algo": "ppo",
+        "transfer_weights": false
+    },
+    "hyperparameters": {
+        "batch_size": 64,
+        "epochs": 5,
+        "learning_rate": 0.0001,
+        "std_start": 0.5,
+        "std_end": 1e-09,
+        "network_noise_clip": 0.05,
+        "total_timesteps": 150000,
+        "episode_steps": 40,
+        "test_episodes": 1000,
+        "eps_clip": 0.2,
+        "gamma": 0.99,
+        "epsilon_end": 0.01,
+        "epsilon": 0.99,
+        "decay": 20000,
+        "network_noise": true
+    }
+}

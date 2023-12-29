@@ -13,406 +13,341 @@ from IPython.display import clear_output
 from time import sleep
 from game import Game
 from collections import namedtuple, deque
-import scipy.stats as stats
 import math
+import json
+import game
+import ppo
+from ppo import PPO
+from ddqn import DDQN
+from network import MLP, Value, DMLP
+import wandb
+import sys
 
-skip_training = False
+with open('config.json') as config_file:
+    config = json.load(config_file)
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print('Using device:', device)
+overall = config.get("overall", {})
+environment_setup = config.get("environment_setup", {})
+model_selection = config.get("model_selection", {})
+hyperparameters = config.get("hyperparameters", {})
 
+WANDA = overall['wandb']
 
+BATCH_SIZE = hyperparameters['batch_size']
+TOTAL_TIMESTEPS = hyperparameters['total_timesteps']
+TEST_EPISODES = hyperparameters['test_episodes']
 
+TRAINED_RED = environment_setup['trained_red']
+SIDE = environment_setup['side']
+TRAINED_BLUE = environment_setup['trained_blue']
+
+n_blue = environment_setup['n_blue']
+n_red = environment_setup['n_red']
+n_red_landingship = environment_setup['n_red_landingship']
+transfer_weights = model_selection['transfer_weights']
+
+SAVE_MODELS = overall['save_models']
+LANDING_OPS = overall['landing_ops']
+
+D_PATH = os.path.join(os.getcwd(), 'discrete_models')
 PATH = os.path.join(os.getcwd(), 'models')
 
-load_models = False
+gif_path = os.path.join(os.getcwd(), 'gif')
 
-class ReplayMemory(object):
-    def __init__(self, capacity):
-        self.capacity = capacity
-        self.memory = deque([],maxlen=capacity)
+arg1 = sys.argv[0]
+if len(sys.argv) > 1:
+    arg2 = sys.argv[1]
+if len(sys.argv) > 2:
+    arg3 = sys.argv[2]
+if len(sys.argv) > 3:
+    arg4 = sys.argv[3]
+if len(sys.argv) > 4:
+    arg5 = sys.argv[4]
 
-    def push(self, *args):
-        """Save a transition"""
-        self.memory.append(Transition(*args))
+"""
+print(f'PyTorch version: {torch.__version__}')
+print('*'*10)
+print(f'_CUDA version: ')
+print('*'*10)
+print(f'CUDNN version: {torch.backends.cudnn.version()}')
+print(f'Available GPU devices: {torch.cuda.device_count()}')
+print(f'Device Name: {torch.cuda.get_device_name()}')
+"""
 
-    def sample(self, batch_size):
-        return random.sample(self.memory, batch_size)
-
-    def __len__(self):
-        return len(self.memory)
-
-    def empty(self):
-        self.memory = deque([], maxlen=self.papacity)
-
-
-Transition = namedtuple('Transition',
-                        ('state', 'action', 'next_state', 'reward', 'done'))
-                        
-
-BATCH_SIZE = 32
-ALPHA = 0.1
-GAMMA = 0.95
-EPSILON = 0.99
-EPSILON_END = 0.01
-DECAY = 500
-TGT_UPD = 10
+skip_training = arg2
+load_models = arg3
+visualize_first_test = arg4
 
 env = Game()
 
-def average_weights(models):
-    averaged_model = models[0].__class__(28)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    averaged_params = averaged_model.parameters()
+seed = overall['seed']
+random.seed(seed)
 
-    for model in models:
-        model_params = model.parameters()
-        for avg_param, model_param in zip(averaged_params, model_params):
-            avg_param.data.add_(model_param.data.to('cpu'))
+ALGO = model_selection['algo']
 
-    for avg_param in averaged_params:
-        avg_param.data.div_(len(models))
+if not (skip_training == 'true'):
 
-    return averaged_model
+    env.reset(n_blue, n_red)
 
-def get_epsilon(t):
-    threshold = EPSILON_END + (EPSILON - EPSILON_END)*math.exp(-1. * t / DECAY)
-    return threshold
-    
-def optimize(policy_net, target_net, memory, optimizer, criterion):
-    
-    policy_net.to(device)
-    target_net.to(device)
-    
-    transitions = memory.sample(BATCH_SIZE)
+    if ALGO == "ppo":
+        """Initialize PPO"""
+        ppo_train = PPO(env, device)
+        #ppo_train.init_networks(2, 0)
 
-    batch = Transition(*zip(*transitions))
-    
-    state_batch = torch.cat(batch.state).to(device).to(torch.float)
-    action_batch = torch.cat(batch.action).to(device)
-    reward_batch = torch.cat(batch.reward).to(device)
-    done = torch.cat(batch.done).to(device)
-    next_state = torch.cat(batch.next_state).to(device).to(torch.float)
-    
-    policy_net.eval()
-    with torch.no_grad():
-        #actions_new = torch.argmax(policy_net(next_state.to(torch.float)).detach(), 1).unsqueeze(0)
-        actions_new = torch.argmax(policy_net(next_state.to(torch.float)).detach(), 1).unsqueeze(0)
-        next_state_values = target_net(next_state.to(torch.float)).squeeze().gather(1, actions_new).squeeze()
-    
-    policy_net.train()
-
-    state_action_values = policy_net(state_batch).gather(1, action_batch.unsqueeze(1)).squeeze()
-    
-    expected_state_action = reward_batch + (GAMMA * next_state_values*done)
-    loss = criterion(state_action_values, expected_state_action)
-    
-    optimizer.zero_grad()
-    loss.backward()
-    
-    for param in policy_net.parameters():
-        param.grad.data.clamp_(-1, 1)
-    
-    optimizer.step()
-    
-    return env
-    
-env.create_combatants()
-env.initialize_game()
-
-blue_memory = []
-red_memory = []
-
-for i in range(len(env.blue_ships)):
-    blue_memory.append(ReplayMemory(10000))
-
-for i in range(len(env.red_ships)):
-    red_memory.append(ReplayMemory(10000))
-    
-if not skip_training:
-    """Training"""
-
-    episodes = 250
-
-    seed = 21 # random.randint(0,100)
-    random.seed(seed)
-    # avg_reward_50 = deque([], 50)
-    
-    all_blue_rewards = []
-    all_red_rewards = []
-
-    total_steps = 0
-    
-    if load_models:
-        for num, unit in enumerate(env.blue_ships):
-            file = os.path.join(PATH, 'blue' + str(num))
-            unit.policy.load_state_dict(torch.load(file))
-            print(f'Loaded model: {file}')
-
-        for num, unit in enumerate(env.red_ships):
-            file = os.path.join(PATH, 'red' + str(num))
-            unit.policy.load_state_dict(torch.load(file))
-            print(f'Loaded model: {file}')
-
-    env.imagen = 0
-
-    for i in range(1, episodes):
-        print('\n EPISODE \n', i)
-        env.initialize_game()
-
-        """
-
-        """
-
-        # env.imagen = 0
-        # env.visualize_grid()
-        
-        epochs, penalties, reward = 0, 0, 0
-
-        episode_steps = 0
-        
-        for unit in env.blue_ships:
-            unit.policy.zero_grad()
-            unit.target.zero_grad()
-            unit.policy.eval()
-            #target_net.eval() # Set NN model to evaluation state
-
-        for unit in env.red_ships:
-            unit.policy.zero_grad()
-            unit.target.zero_grad()
-            unit.policy.eval()
-            #target_net.eval() # Set NN model to evaluation state
-
-        #criterion = nn.SmoothL1Loss()
-        criterion = nn.MSELoss()
-
-        done = 1
-        
-        while done == 1:
-            
-            env.red_ew.clear()
-            env.blue_ew.clear()
-            env.engagements.clear()
-
-            blue_memory_inserts = []
-            red_memory_inserts = []
-
-            
-            if episode_steps % 20 == 0:
-                print('Episode steps: {}'.format(episode_steps))
-
-            for m, unit in enumerate(env.blue_ships):
-                
-                unit.policy.to(device)
-
-                blue_state = unit.get_obs()
-                #blue_state = np.expand_dims(state, 0)
-
-                e = get_epsilon(unit.steps_done)
-
-                if random.uniform(0, 1) < e:
-                    blue_action = random.randint(0, unit.n_actions-1) # Pick random action
+        """Training"""
+        if load_models == 'true':
+            if transfer_weights:
+                if SIDE == "blue":
+                    actor = MLP(4*2+3+12, 4).to(device)
+                    actor.load_state_dict(torch.load(os.path.join(PATH, 'blue_actor.pth')))
+                    critic = Value((4*2+7**2+3)*2).to(device)
+                    critic.load_state_dict(torch.load(os.path.join(PATH, 'blue_critic.pth')))
+                    ppo_train.transfer_weights(actor, critic, SIDE)
+                    print("Loaded existing Blue actor model and transferred weights", PATH)
+                    print("Loaded existing Blue critic model and transferred weights", PATH)
                 else:
-                    
-                    with torch.no_grad():
-                        a = torch.tensor(blue_state, dtype=torch.float32).unsqueeze(0).to(device)
-                        a = unit.policy(a)
-                        a = a.detach()
-                        blue_action = torch.argmax(a).item()
-                
-                oldpos = unit.position
-
-                blue_new_state, blue_reward, blue_done, info = env.step(unit, blue_action) # check next state w.r.t. the action
-                
-                blue_reward -= 0.01*unit.steps_done
-
-                memory = blue_memory[m]
-
-                blue_memory_inserts.append((blue_state, blue_action, blue_new_state, blue_reward, blue_done))
-                
-                total_steps += 1
-                unit.steps_done += 1
-            
-                if unit.steps_done % BATCH_SIZE == 0 and memory.__len__() > BATCH_SIZE:
-                
-                    optimize(unit.policy, unit.target, memory, unit.optimizer, criterion)
-                    #file = os.path.join(PATH, 'blue' + str(m))
-                    #torch.save(unit.target.state_dict(), file)
-                
-                if unit.steps_done % TGT_UPD == 0:
-                    unit.target.load_state_dict(unit.policy.state_dict())
-
-                if unit.environment.num_red != len(unit.environment.red_ships):
-                    print('Red ship destroyed.')
-                
-                unit.environment.num_red = len(unit.environment.red_ships)
-
-            for m, unit in enumerate(env.red_ships):
-
-                unit.policy.to(device)
-                
-                state = unit.get_obs()
-                #state = np.expand_dims(state, 0)
-
-                e = get_epsilon(unit.steps_done)
-                    
-                if random.uniform(0, 1) < e:
-                    action = random.randint(0, unit.n_actions-1) # Pick random action
-                else:
-                    with torch.no_grad():
-                        a = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(device)
-                        #print(a.shape)
-                        a = unit.policy(a)
-                        a = a.detach()
-                        action = torch.argmax(a).item()
-
-                oldpos = unit.position
-                new_state, red_reward, done, info = env.step(unit, action) # check next state w.r.t. the action
-                
-                red_reward -= 0.01*unit.steps_done
-
-                all_red_rewards.append(red_reward)
-
-                red_memory_inserts.append((state, action, new_state, red_reward, done))
-
-                memory = red_memory[m]
-
-                total_steps += 1
-
-                unit.steps_done += 1
-            
-                if unit.steps_done % BATCH_SIZE == 0 and memory.__len__() > BATCH_SIZE:
-                
-                    optimize(unit.policy, unit.target, memory, unit.optimizer, criterion)
-                    #file = os.path.join(PATH, 'red' + str(m))
-                    #torch.save(unit.target.state_dict(), file)
-
-                if unit.steps_done % TGT_UPD == 0:
-                    unit.target.load_state_dict(unit.policy.state_dict())
-
-                if unit.environment.num_blue != len(unit.environment.blue_ships):
-                    print('Blue ship destroyed.')
-
-                unit.environment.num_blue = len(unit.environment.blue_ships)
-
-
-            blue_total_reward  = (env.num_red-len(env.red_ships))*10 - (env.num_blue-len(env.blue_ships))*5
-
-            if env.num_red == 0:
-                blue_total_reward += 100
-
-            red_total_reward = (env.num_blue-len(env.blue_ships))*10 - (env.num_red-len(env.red_ships))*5
-
-            if env.num_blue == 0:
-                red_total_reward += 100
-
-            min_dist = 200
-
-            for unit in env.red_ships:
-                if math.sqrt((unit.position[0]-50)**2 + (unit.position[1]-50)**2) < min_dist:
-                    min_dist = math.sqrt((unit.position[0]-50)**2 + (unit.position[1]-50)**2)
-
-            if min_dist != 0:
-                red_total_reward += (1/min_dist)
+                    actor = MLP(4*2+3+12, 4).to(device)
+                    actor.load_state_dict(torch.load(os.path.join(PATH, 'red_actor.pth')))
+                    critic = Value((4*2+7**2+3)*2).to(device)
+                    critic.load_state_dict(torch.load(os.path.join(PATH, 'red_critic.pth')))
+                    ppo_train.transfer_weights(actor, critic, SIDE)
+                    print("Loaded existing Red actor model and transferred weights", PATH)
+                    print("Loaded existing Red critic model and transferred weights", PATH)
+                    ppo_train.actor.load_state_dict(torch.load(os.path.join(PATH, 'blue_actor.pth')))
+                    print("Loaded existing Blue actor model", os.path.join(PATH, 'blue_actor.pth'))
+                    ppo_train.critic.load_state_dict(torch.load(os.path.join(PATH, 'blue_critic.pth')))
+                    print("Loaded existing Blue critic model", os.path.join(PATH, 'blue_critic.pth'))
             else:
-                red_total_reward += 0
+                if TRAINED_BLUE:
+                    ppo_train.actor.load_state_dict(torch.load(os.path.join(PATH, 'blue_actor.pth')))
+                    print("Loaded existing Blue actor model", os.path.join(PATH, 'blue_actor.pth'))
+                    ppo_train.critic.load_state_dict(torch.load(os.path.join(PATH, 'blue_critic.pth')))
+                    print("Loaded existing Blue critic model", os.path.join(PATH, 'blue_critic.pth'))
+                    ppo_train.actor_optimizer.load_state_dict(torch.load(os.path.join(PATH, 'blue_actor_optimizer.pth')))
+                    print("Loaded existing Blue actor optimizer", os.path.join(PATH, 'blue_actor_optimizer.pth'))
+                    ppo_train.critic_optimizer.load_state_dict(torch.load(os.path.join(PATH, 'blue_critic_optimizer.pth')))
+                    print("Loaded existing Blue critic optimizer", os.path.join(PATH, 'blue_critic_optimizer.pth'))
+            if TRAINED_RED and not transfer_weights:
+                ppo_train.red_actor.load_state_dict(torch.load(os.path.join(PATH, 'red_actor.pth')))
+                print("Loaded existing Red actor model", os.path.join(PATH, 'red_actor.pth'))
+                ppo_train.red_critic.load_state_dict(torch.load(os.path.join(PATH, 'red_critic.pth')))
+                print("Loaded existing Red critic model", os.path.join(PATH, 'red_critic.pth'))
+                ppo_train.red_actor_optimizer.load_state_dict(torch.load(os.path.join(PATH, 'red_actor_optimizer.pth')))
+                print("Loaded existing Red actor optimizer", os.path.join(PATH, 'red_actor_optimizer.pth'))
+                ppo_train.red_critic_optimizer.load_state_dict(torch.load(os.path.join(PATH, 'red_critic_optimizer.pth')))
+                print("Loaded existing Red critic optimizer", os.path.join(PATH, 'red_critic_optimizer.pth'))
+            elif TRAINED_RED and transfer_weights:
+                actor = MLP(4*2+3+12, 4).to(device)
+                actor.load_state_dict(torch.load(os.path.join(PATH, 'red_actor.pth')))
+                critic = Value((4*2+7**2+3)*2).to(device)
+                critic.load_state_dict(torch.load(os.path.join(PATH, 'red_critic.pth')))
+                ppo_train.transfer_weights(actor, critic, SIDE)
+                print("Loaded existing Red actor model and transferred weights", PATH)
+                print("Loaded existing Red critic model and transferred weights", PATH)
 
-            b_reward = 0
+        env.reset(n_blue, n_red)
 
-            for m, n in enumerate(blue_memory_inserts):
-                state, action, new_state, breward, done = n
-                blue_memory[m].push(
-                    torch.tensor(state).unsqueeze(0),
-                    torch.tensor([action]),
-                    torch.tensor(new_state).unsqueeze(0),
-                    torch.tensor([breward + blue_total_reward]),
-                    torch.tensor([done])
-                    )
-                b_reward += breward
-                
-            all_blue_rewards.append(b_reward)
+        all_blue_rewards = []
+        all_red_rewards = []
 
-            r_reward = 0
-                
-            for m, n in enumerate(red_memory_inserts):
-                state, action, new_state, rreward, done = n
-                red_memory[m].push(
-                    torch.tensor(state).unsqueeze(0),
-                    torch.tensor([action]),
-                    torch.tensor(new_state).unsqueeze(0),
-                    torch.tensor([rreward + red_total_reward]),
-                    torch.tensor([done])
-                    )
-                r_reward += rreward
+        total_steps = 1
 
-            all_red_rewards.append(r_reward)
-            
-            episode_steps += 1
+        env.imagen = 0
 
-            if episode_steps > 220:
-                done = 0
+        red_victory = 0
+        blue_victory = 0
 
-            #if i % 50 == 0:
-            #    env.visualize_grid()
-
-            if env.engagements:
-                env.visualize_grid()
-
-        if i % 20 == 0:
-            blue_models = []
-            for unit in env.blue_ships:
-                blue_models.append(unit.policy) 
-
-            red_models = []
-            for unit in env.red_ships:
-                red_models.append(unit.policy)
-
-            if len(blue_models) > 1:
-                blue_averaged_model = average_weights(blue_models)
-                for unit in env.blue_ships:
-                    unit.policy.load_state_dict(blue_averaged_model.state_dict())
-                print("Blue models aggregated.")
-
-            if len(red_models) > 1:
-                red_averaged_model = average_weights(red_models)       
-                for unit in env.red_ships: 
-                    unit.policy.load_state_dict(red_averaged_model.state_dict())
-                print("Red models aggregated.")
-
-            
-            """
-            if i % 100 == 0:
-                clear_output(wait=True)
-                print(f"Model saved, Episode: {i}", PATH)
-                torch.save(unit.target_net.state_dict, PATH)
-            """
-    print("Training finished.\n")
-    
-    fig, axs = plt.subplots(2, 1, constrained_layout=True)
-    axs[0].plot(list(range(0, len(all_blue_rewards))), all_blue_rewards, 'b', '-')
-    fig.suptitle('Blue rewards')
-
-    axs[1].plot(list(range(0, len(all_red_rewards))), all_red_rewards, 'r', '-')
-    fig.suptitle('Red rewards')
-
-    plt.show()
+        print('\n Training\n')
         
-    for num, unit in enumerate(env.blue_ships):
-        file = os.path.join(PATH, 'blue' + str(num))
-        torch.save(unit.target.state_dict(), file)
-        print(f'Saved model: {file}')
+        #env.visualize_grid(show=True)
 
-    for num, unit in enumerate(env.red_ships):
-        file = os.path.join(PATH, 'red' + str(num))
-        torch.save(unit.target.state_dict(), file)
-        print(f'Saved model: {file}')
+        ppo_train.learn(TOTAL_TIMESTEPS, SAVE_MODELS)
+
+        print("Training finished.\n")
+        
+        #fig, axs = plt.subplots(2, 1, constrained_layout=True)
+        #axs[0].plot(list(range(0, len(ppo_train.reward_log))), ppo_train.reward_log, 'b', '-')
+        #fig.suptitle('Blue rewards')
+
+        #axs[1].plot(list(range(0, len(all_red_rewards))), all_red_rewards, 'r', '-')
+        #fig.suptitle('Red rewards')
+
+        #plt.show()
+
+    if ALGO == "ddqn":
+        
+        ddqn = DDQN(env, device)
+
+        """Training"""
+        if load_models == 'true':
+            if transfer_weights:
+                policy = DMLP(env.observation_space).to(device)
+                policy.load_state_dict(torch.load(os.path.join(D_PATH, 'target.pth')))
+                target = DMLP(env.observation_space).to(device)
+                target.load_state_dict(torch.load(os.path.join(D_PATH, 'target.pth')))
+                ddqn.transfer_weights(policy, target)
+                print("Loaded existing Blue policy model and transferred weights", D_PATH)
+                print("Loaded existing Blue target model and transferred weights", D_PATH)
+            else:
+                if TRAINED_BLUE:
+                    ddqn.policy_net.load_state_dict(torch.load(os.path.join(D_PATH, 'target.pth')))
+                    print("Loaded existing Blue policy model", os.path.join(D_PATH, 'target.pth'))
+                    ddqn.target_net.load_state_dict(torch.load(os.path.join(D_PATH, 'target.pth')))
+                    print("Loaded existing Blue target model", os.path.join(D_PATH, 'target.pth'))
+            if TRAINED_RED:
+                ddqn.red_policy_net.load_state_dict(torch.load(os.path.join(D_PATH, 'red_target.pth')))
+                print("Loaded existing Red policy model", os.path.join(D_PATH, 'red_target.pth'))
+                ddqn.red_target_net.load_state_dict(torch.load(os.path.join(D_PATH, 'red_target.pth')))
+                print("Loaded existing Red target model", os.path.join(D_PATH, 'red_target.pth'))
+
+        env.reset(n_blue, n_red)
+        env.imagen = 0
+
+        ddqn.learn()
+
+        print("Training finished.\n")
+
+
+if skip_training == 'true':
+    #Load actor model
+
+    project_name = ALGO+"_test"
+    if WANDA:
+        wandb.init(project=project_name)
+
+    env.reset(n_blue, n_red)
+
+    if ALGO == "ppo":
+        actor = MLP(env.observation_space-7*7+12, env.action_space).to(device)
+        actor.load_state_dict(torch.load(os.path.join(PATH, 'blue_actor.pth')))
+        actor.eval()
+    if ALGO == "ddqn":
+        policy = DMLP(env.observation_space).to(device)
+        policy.load_state_dict(torch.load(os.path.join(D_PATH, 'target.pth')))
+        policy.eval()
+    if ALGO == "ddpg":
+        actor = MLP(env.observation_space, env.action_space).to(device)
+        actor.load_state_dict(torch.load(os.path.join(PATH, 'ddpg_actor.pth')))
+
+    print(f"Loaded existing BLUE {ALGO} model {PATH}")
+
+    if TRAINED_RED:
+        if ALGO == "ppo":
+            red_actor = MLP(env.red_observation_space-7*7+12, env.action_space).to(device)
+            red_actor.load_state_dict(torch.load(os.path.join(PATH, 'red_actor.pth')))
+            red_actor.eval()
+        if ALGO == "ddqn":
+            red_policy = DMLP(env.red_observation_space).to(device)
+            red_policy.load_state_dict(torch.load(os.path.join(D_PATH, 'red_target.pth')))
+            red_policy.eval()
+
+        print(f"Loaded existing RED {ALGO} model {PATH}")
+
+    red_episode_win = 0
+    blue_episode_win = 0
+
+    heatmap = np.zeros((env.grid_size, env.grid_size))
+    coldmap = np.zeros((env.grid_size, env.grid_size))
     
-    print("Training finished.\n")
+    with torch.no_grad():
+        preordained_actions = [env.red1_actions, env.red2_actions, env.red3_actions]
+
+        episodes_with_encounter = 0
+
+        blue_engagements = 0
+        red_engagements = 0
+
+        for episode in range(TEST_EPISODES):
+            if not LANDING_OPS:
+                env.reset(n_blue, n_red)
+            else:
+                env.reset(n_blue, n_red+n_red_landingship)
+            print('\n TEST EPISODE \n', episode)
+            for j in range(40):
+                
+                epochs, penalties, reward = 0, 0, 0
+
+                episode_steps = 0
+
+                actions_for_step = []
+
+                env.engagements.clear()
+                env.blue_ew.clear()
+                env.red_ew.clear()
+                
+                for i, ship in enumerate(env.blue_ships):
+                    if ship is not None:
+                        state = ship.get_obs()
+                        if ALGO == "ppo":
+                            with torch.no_grad():
+                                action, log_prob = actor(torch.tensor(state, dtype=torch.float32, device = device))
+                                actions_for_step.append(action.cpu().numpy())
+                        if ALGO == "ddqn":
+                            rad, msl, mov = policy(torch.tensor(state, dtype=torch.float32, device = device))
+                            
+                            rad = rad.argmax(dim=0).item()
+                            msl = msl.argmax(dim=0).item()
+                            mov = mov.argmax(dim=0).item()
+                            actions_for_step.append(np.asarray([rad, msl, mov]))
+                    else:
+                        actions_for_step.append(np.zeros((4)))
+
+                for i, ship in enumerate(env.red_ships):
+                    if ALGO == "ppo":
+                        if TRAINED_RED and j > 13:
+                            if ship is not None:
+                                state = ship.get_obs()
+                                with torch.no_grad():
+                                    action, log_prob = red_actor(torch.tensor(state, dtype=torch.float32, device = device))
+                                    actions_for_step.append(action.cpu().numpy())
+                            else:
+                                actions_for_step.append(np.zeros((4)))
+                        else:
+                            preordained_red_actions = preordained_actions[i]
+                            actions_for_step.append(preordained_red_actions[j])
+                    if ALGO == "ddqn":
+                        if TRAINED_RED:
+                            for i, ship in enumerate(env.red_ships):
+                                if ship is not None:
+                                    state = ship.get_obs()
+                                    rad, msl, mov = red_policy(torch.tensor(state, dtype=torch.float32, device = device))
+                                    rad = rad.argmax(dim=0).item()
+                                    msl = msl.argmax(dim=0).item()
+                                    mov = mov.argmax(dim=0).item()
+                                    if j < 20:
+                                        mov = np.random.randint(1,5)
+                                    actions_for_step.append(np.asarray([rad, msl, mov]))
+                                else:
+                                    actions_for_step.append(np.zeros((4)))
+                        else:
+                            actions_for_step.append([np.random.randint(0,1), np.random.randint(0,4), np.random.randint(0,49)])
+
+
+                observations, rewards, done, _ = env.step(actions_for_step)
+                
+                if visualize_first_test == 'true' and episode == 0:
+                    print("Visualizing test episode step " + str(j))
+                    env.visualize_grid(path=gif_path, animation=True)
+
+                if done == 0:
+                    break
+            
+            if env.blue_engagements > blue_engagements or env.red_engagements > red_engagements:
+                blue_engagements = env.blue_engagements
+                red_engagements = env.red_engagements
+                episodes_with_encounter += 1
+
+            blue_episode_win += env.blue_victory
+            red_episode_win += env.red_victory
+            heatmap += env.heatmap
+            coldmap += env.coldmap
     
-"""
-else:
-    target_net = torch.load(PATH)
-    target_net.eval()
-    
-    print("Loaded existing q-table", PATH)
-"""
+    if WANDA:
+        wandb.finish()
+
+    env.visualize_heatmap(heatmap, coldmap)
+                
+
+    print(f'Blue victories: {blue_episode_win}\nBlue sinkings: {env.blue_engagements}\nRed victories: {red_episode_win}\nRed sinkings: {env.red_engagements}\nEpisodes with encounter: {episodes_with_encounter}\n')
