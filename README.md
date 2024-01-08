@@ -15,4 +15,6 @@ The key to successful tactics is to utilize the littoral area to cover its own u
 
 The agents (DDQN and MAPPO) are in respective files. The combatant-class includes surface combatants of different sizes while the landing ship class defines solely landing ships. The environment is in game.py file and the hyperparameters for features are mainly managed in config.json file. The environment is run by calling main.py with boolean arguments for [skip training], [load models] and [visualize first test run].
 
-To train an agent, the parameters have to be set in configuration file. The purpose is to train the Blue side first. Initially, the "trained" parameter is set to false and other options selected as desired. Then the call "python main.py false false false" initializes training. If save_models is set to True, the resulting models are saved, after which the training can be swapped to use the trained model against an initial opposing agent.
+To train an agent, the parameters have to be set in configuration file. The purpose is to train the Blue side first. Initially, the "trained" parameter is set to false and other options are selected as desired. Then the call
+"python main.py false false false"
+initializes training. If save_models is set to True, the resulting models are saved, after which the training can be swapped to use the trained model against an initial opposing agent.
