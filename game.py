@@ -276,19 +276,19 @@ class Game:
             distance_to_landing = math.sqrt((unit.position[0]-unit.landing_zone[0])**2 + (unit.position[1]-unit.landing_zone[1])**2)
             if distance_to_landing > 0:
                 if distance_to_landing < unit.distance_to_landing_zone:
-                    reward += 2
+                    reward += 1
                     unit.distance_to_landing_zone = distance_to_landing
                 else:
                     reward -= 1
             else:
                 reward += 100
             
-            """
+            
             if distance_to_landing == 0:
                 reward += 100
             else:
                 reward += (math.log10(100/distance_to_landing))*5
-            """
+            
         #if TACTICS == "aggressive":
         #    reward = reward * ((40 / (unit.steps_done+1)))
 
@@ -768,7 +768,7 @@ class Game:
                 launch_n = self.num_blue if key == "blue" else self.num_red
 
                 if key == "red" and LANDING_OPS:
-                    launch_n = launch_n - self.red_landing_ships
+                    launch_n = N_RED
 
                 if len(self.launch_sites[key]) >= launch_n:
 
@@ -879,9 +879,10 @@ class Game:
                             plt.arrow(x1, y1, x2-x1, y2-y1, width=0.1, color='orangered', shape='full', head_width=2, head_length=2, length_includes_head=True)
 
             else:
-                landing_site = KMeans(n_clusters=1, random_state=0, n_init='auto').fit(np.asarray(self.launch_sites[key])).cluster_centers_
+                if len(self.coa_path[key]) > 0:
+                    landing_site = KMeans(n_clusters=1, random_state=0, n_init='auto').fit(np.asarray(self.coa_path[key])).cluster_centers_
 
-                plt.plot(landing_site[0][1], 100 - landing_site[0][0] - 1, 'rs', markersize=25, alpha=0.2)
+                    plt.plot(landing_site[0][1], 100 - landing_site[0][0] - 1, 'rs', markersize=25, alpha=0.2)
 
 
         plt.colorbar()
